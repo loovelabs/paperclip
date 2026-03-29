@@ -460,42 +460,109 @@ export async function startServer(): Promise<StartedServer> {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
   if (config.deploymentMode === "authenticated") {
-    const {
-      createBetterAuthHandler,
-      createBetterAuthInstance,
-      deriveAuthTrustedOrigins,
-      resolveBetterAuthSession,
-      resolveBetterAuthSessionFromHeaders,
-    } = await import("./auth/better-auth.js");
-    const betterAuthSecret =
-      process.env.BETTER_AUTH_SECRET?.trim() ?? process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
-    if (!betterAuthSecret) {
-      throw new Error(
-        "authenticated mode requires BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET) to be set",
+    // -----------------------------------------------------------------------
+    // LOOVE Edge OAuth: Supabase SSO as primary session resolver
+    // -----------------------------------------------------------------------
+    const { loadSupabaseSsoConfig, createSupabaseSsoSessionResolver, createSupabaseSsoAuthHandler } =
+      await import("./auth/supabase-sso.js");
+    const ssoConfig = loadSupabaseSsoConfig();
+
+    if (ssoConfig) {
+      logger.info(
+        { supabaseUrl: ssoConfig.supabaseUrl, looveLoginUrl: ssoConfig.looveLoginUrl },
+        "LOOVE Supabase SSO enabled as primary auth provider",
       );
-    }
-    const derivedTrustedOrigins = deriveAuthTrustedOrigins(config);
-    const envTrustedOrigins = (process.env.BETTER_AUTH_TRUSTED_ORIGINS ?? "")
-      .split(",")
-      .map((value) => value.trim())
-      .filter((value) => value.length > 0);
-    const effectiveTrustedOrigins = Array.from(new Set([...derivedTrustedOrigins, ...envTrustedOrigins]));
-    logger.info(
-      {
-        authBaseUrlMode: config.authBaseUrlMode,
-        authPublicBaseUrl: config.authPublicBaseUrl ?? null,
-        trustedOrigins: effectiveTrustedOrigins,
-        trustedOriginsSource: {
-          derived: derivedTrustedOrigins.length,
-          env: envTrustedOrigins.length,
+      const supabaseResolveSession = createSupabaseSsoSessionResolver(db as any, ssoConfig);
+      const supabaseAuthHandler = createSupabaseSsoAuthHandler(db as any, ssoConfig);
+
+      // Also initialize better-auth as a fallback for existing sessions/API keys
+      let betterAuthResolveSession:
+        | ((req: ExpressRequest) => Promise<BetterAuthSessionResult | null>)
+        | undefined;
+      let betterAuthResolveFromHeaders:
+        | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
+        | undefined;
+      const betterAuthSecret =
+        process.env.BETTER_AUTH_SECRET?.trim() ?? process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
+      if (betterAuthSecret) {
+        const {
+          createBetterAuthHandler,
+          createBetterAuthInstance,
+          deriveAuthTrustedOrigins,
+          resolveBetterAuthSession,
+          resolveBetterAuthSessionFromHeaders,
+        } = await import("./auth/better-auth.js");
+        const derivedTrustedOrigins = deriveAuthTrustedOrigins(config);
+        const envTrustedOrigins = (process.env.BETTER_AUTH_TRUSTED_ORIGINS ?? "")
+          .split(",")
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0);
+        const effectiveTrustedOrigins = Array.from(new Set([...derivedTrustedOrigins, ...envTrustedOrigins]));
+        const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
+        betterAuthHandler = createBetterAuthHandler(auth);
+        betterAuthResolveSession = (req) => resolveBetterAuthSession(auth, req);
+        betterAuthResolveFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
+        logger.info("Better-auth initialized as fallback auth provider");
+      }
+
+      // Composite resolver: try Supabase SSO first, then fall back to better-auth
+      resolveSession = async (req) => {
+        const ssoResult = await supabaseResolveSession(req);
+        if (ssoResult) return ssoResult;
+        if (betterAuthResolveSession) return betterAuthResolveSession(req);
+        return null;
+      };
+      resolveSessionFromHeaders = async (headers) => {
+        // For WebSocket headers, try better-auth first (SSO cookies may not propagate)
+        if (betterAuthResolveFromHeaders) {
+          const baResult = await betterAuthResolveFromHeaders(headers);
+          if (baResult) return baResult;
+        }
+        return null;
+      };
+
+      // Use the Supabase SSO handler as the primary auth handler
+      // but keep better-auth handler as fallback if initialized
+      if (!betterAuthHandler) {
+        betterAuthHandler = supabaseAuthHandler;
+      }
+    } else {
+      // No Supabase SSO config – fall back to pure better-auth
+      logger.info("No LOOVE Supabase SSO config found; using better-auth only");
+      const {
+        createBetterAuthHandler,
+        createBetterAuthInstance,
+        deriveAuthTrustedOrigins,
+        resolveBetterAuthSession,
+        resolveBetterAuthSessionFromHeaders,
+      } = await import("./auth/better-auth.js");
+      const betterAuthSecret =
+        process.env.BETTER_AUTH_SECRET?.trim() ?? process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
+      if (!betterAuthSecret) {
+        throw new Error(
+          "authenticated mode requires BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET) to be set, " +
+            "or configure LOOVE_SUPABASE_URL + LOOVE_SUPABASE_ANON_KEY for Supabase SSO",
+        );
+      }
+      const derivedTrustedOrigins = deriveAuthTrustedOrigins(config);
+      const envTrustedOrigins = (process.env.BETTER_AUTH_TRUSTED_ORIGINS ?? "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      const effectiveTrustedOrigins = Array.from(new Set([...derivedTrustedOrigins, ...envTrustedOrigins]));
+      logger.info(
+        {
+          authBaseUrlMode: config.authBaseUrlMode,
+          authPublicBaseUrl: config.authPublicBaseUrl ?? null,
+          trustedOrigins: effectiveTrustedOrigins,
         },
-      },
-      "Authenticated mode auth origin configuration",
-    );
-    const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
-    betterAuthHandler = createBetterAuthHandler(auth);
-    resolveSession = (req) => resolveBetterAuthSession(auth, req);
-    resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
+        "Authenticated mode auth origin configuration",
+      );
+      const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
+      betterAuthHandler = createBetterAuthHandler(auth);
+      resolveSession = (req) => resolveBetterAuthSession(auth, req);
+      resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
+    }
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
   }
